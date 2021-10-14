@@ -1,0 +1,13 @@
+gitlab_token: y0urp3rs0na1t0k3n
+gitlab_url: https://gitlab.com
+default_protected_branches:
+  - name: develop*
+    push: No One
+    merge: Developers + Maintainers
+  - name: release*
+    push: No One
+    merge: Maintainers
+  - name: master
+    push: No One
+    merge: Maintainers
+
