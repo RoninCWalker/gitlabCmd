@@ -5,7 +5,7 @@
 
    ```yaml
 	gitlab_token: <your valid token>
-   	gitlab_url: https://gitlab-dso.techcombank.com.vn
+   	gitlab_url: https://gitlab.com
    	default_protected_branches:
 	  - name: develop*
 	    push: No One
