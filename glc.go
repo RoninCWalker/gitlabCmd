@@ -26,12 +26,18 @@ type config struct {
 	GitlabToken              string                  `yaml:"gitlab_token"`
 	GitlabUrl                string                  `yaml:"gitlab_url"`
 	DefaultProtectedBranches []protectedBranchConfig `yaml:"default_protected_branches"`
+	DefaultProtectedTags     []protectedTagConfig    `yaml:"default_protected_tags"`
 }
 
 type protectedBranchConfig struct {
 	Name  string         `yaml:"name"`
 	Push  accessDescEnum `yaml:"push"`
 	Merge accessDescEnum `yaml:"merge"`
+}
+
+type protectedTagConfig struct {
+	Name   string         `yaml:"name"`
+	Create accessDescEnum `yaml:"create"`
 }
 
 func (in *config) readConfig() *config {
@@ -249,9 +255,10 @@ func trace() string {
 type httpMethodEnum string
 
 const (
-	GET  httpMethodEnum = "GET"
-	POST httpMethodEnum = "POST"
-	PUT  httpMethodEnum = "PUT"
+	GET    httpMethodEnum = "GET"
+	POST   httpMethodEnum = "POST"
+	PUT    httpMethodEnum = "PUT"
+	DELETE httpMethodEnum = "DELETE"
 )
 
 func doHttpRequest(method httpMethodEnum, url string, body io.Reader) (*http.Response, error) {
@@ -310,12 +317,37 @@ func setProtectedBranch(pid string, gid string) {
 	var projects []gitlabProject = getProjectList(pid, gid)
 	for _, p := range projects {
 		for _, c := range conf.DefaultProtectedBranches {
+			// Delete protected branch
 			url := conf.GitlabUrl +
+				fmt.Sprintf("/api/v4/projects/%d/protected_branches/%s", p.Id, url2.QueryEscape(c.Name))
+			res, err := doHttpRequest(DELETE, url, nil)
+			handleError(err)
+			fmt.Printf("%d, %s, %s, %s\n", p.Id, p.HttpUrlToRepo, c.Name, res.Status)
+
+			// Set protected branch
+			url = conf.GitlabUrl +
 				fmt.Sprintf("/api/v4/projects/%d/protected_branches?name=%s&push_access_level=%d&merge_access_level=%d",
 					p.Id, url2.QueryEscape(c.Name), accessDescMap[c.Push], accessDescMap[c.Merge])
+			res, err = doHttpRequest(POST, url, nil)
+			handleError(err)
+			fmt.Printf("%d, %s, %s, %s\n", p.Id, p.HttpUrlToRepo, c.Name, res.Status)
+		}
+	}
+}
+
+// Set proctected branch based on the default_protected_branches
+// based on Project Id (pid) or Group Id (gid)
+func setProtectedTag(pid string, gid string) {
+	log.Printf("%s - param: %s,%s", trace(), pid, gid)
+	var projects []gitlabProject = getProjectList(pid, gid)
+	for _, p := range projects {
+		for _, c := range conf.DefaultProtectedTags {
+			url := conf.GitlabUrl +
+				fmt.Sprintf("/api/v4/projects/%d/protected_tags?name=%s&create_access_level=%d",
+					p.Id, url2.QueryEscape(c.Name), accessDescMap[c.Create])
 			res, err := doHttpRequest(POST, url, nil)
 			handleError(err)
-			fmt.Printf("%d, %s, %s, %s\n", p.Id, p.Name, c.Name, res.Status)
+			fmt.Printf("%d, %s, %s, %s\n", p.Id, p.HttpUrlToRepo, c.Name, res.Status)
 		}
 	}
 }
@@ -381,17 +413,33 @@ func getProject(pid string) gitlabProject {
 
 // Return list  ofall the projects in the Groupd Id (gid).
 // If print = true, print the result to stdout
-func listProjects(gid string, print bool) []gitlabProject {
+func listProjects(gid string, print bool, page ...int) []gitlabProject {
 	log.Printf("%s - param: %s, %t", trace(), gid, print)
-	path := "/api/v4/groups/" + gid + "/projects"
+	var currentPage int
+	if len(page) == 0 {
+		currentPage = 1
+	} else {
+		currentPage = page[0]
+	}
+	path := "/api/v4/groups/" + gid + "/projects?per_page=50&page=" + strconv.Itoa(currentPage)
 	url := conf.GitlabUrl + path
 	prj, err := doHttpRequest(GET, url, nil)
 	handleError(err)
+	totalPages, err := strconv.Atoi(prj.Header.Get("x-total-pages"))
+	handleError(err)
+	log.Printf("%s - total pages: %d", trace(), totalPages)
 	body, err := io.ReadAll(prj.Body)
 	handleError(err)
 	prj.Body.Close()
 	var prjs []gitlabProject
 	json.Unmarshal(body, &prjs)
+
+	currentPage = currentPage + 1
+	if currentPage <= totalPages {
+		morePrjs := listProjects(gid, false, currentPage)
+		prjs = append(prjs, morePrjs...)
+	}
+
 	if print && len(prjs) > 0 {
 		for _, p := range prjs {
 			fmt.Printf("%d, %s, %s\n", p.Id, p.PathWithNamespace, p.HttpUrlToRepo)
@@ -429,7 +477,7 @@ type tagCSVRecord struct {
 
 // Tag the repo based on the data in the CSV File (csvfile) with suffix yymmdd-hash.
 // If nosuffix is true, then the tag will not have the suffix.
-func tagCSV(csvfile string, nosuffix bool) {
+func tagCSV(csvfile string, nosuffix bool, force bool) {
 	log.Printf("%s - param: %s", trace(), csvfile)
 	var csvEntries []tagCSVRecord
 	var tag string
@@ -467,7 +515,14 @@ func tagCSV(csvfile string, nosuffix bool) {
 				tag = fmt.Sprintf("%s-%s-%s", project.Prefix, todayStr, projectHash)
 			}
 			url := fmt.Sprintf("%s/api/v4/projects/%s/repository/tags?tag_name=%s&ref=%s&message=%s",
-				conf.GitlabUrl, project.Pid, tag, url2.QueryEscape(project.Branch), url2.QueryEscape(project.Message))
+				conf.GitlabUrl, project.Pid, url2.QueryEscape(tag), url2.QueryEscape(project.Branch), url2.QueryEscape(project.Message))
+
+			if force {
+				deleteUrl := fmt.Sprintf("%s/api/v4/projects/%s/repository/tags/%s",
+					conf.GitlabUrl, project.Pid, url2.QueryEscape(tag))
+				_, err := doHttpRequest(DELETE, deleteUrl, nil)
+				handleError(err)
+			}
 			res, err := doHttpRequest(POST, url, nil)
 			handleError(err)
 			fmt.Printf("%s, %s/%s/-/tags/%s, %s : %s\n", project.Pid, conf.GitlabUrl, project.Path, tag, project.Branch, res.Status)
@@ -547,10 +602,12 @@ var (
 	ls          *string
 	lspbranch   *bool
 	setpbranch  *bool
+	setptag     *bool
 	grpid       *string
 	prjid       *string
 	tagcsv      *string
 	tagnosuffix *bool
+	tagforce    *bool
 	bulkmr      *string // Bulk Merge Request
 )
 
@@ -567,10 +624,12 @@ func main() {
 	ls = flag.String("ls", "", "List all the repo in a Group")
 	lspbranch = flag.Bool("lspb", false, "List all the protected branch settings in a group, 2nd parameter is -gid or -pid")
 	setpbranch = flag.Bool("setpb", false, "Set branch(es) to be protected by the default configuration, 2nd parameter is -gid or -pid")
+	setptag = flag.Bool("setptag", false, "Set tag(s) to be protected by the default configuration, 2nd parameter is -gid or -pid")
 	grpid = flag.String("gid", "", "The group Id to perform an action")
 	prjid = flag.String("pid", "", "The project id to perform an action")
 	tagcsv = flag.String("tagcsv", "", "CSV file with tagging information. The tag will suffix with yymmdd-hash. CSV Header: pid,path,prefix,branch,message")
 	tagnosuffix = flag.Bool("tagnosuffix", false, "depends on -tagcsv and this will disable the suffix of yymmdd-hash")
+	tagforce = flag.Bool("forcetag", false, "depends on -tagcsv. This will force tag. If tag exist, it will delete and recreate")
 	bulkmr = flag.String("bulkmr", "", "CSV file with bulk merge request. CSV Header: pid,path,source,target,title")
 	flag.Parse()
 
@@ -596,8 +655,11 @@ func main() {
 	if *setpbranch {
 		setProtectedBranch(*prjid, *grpid)
 	}
+	if *setptag {
+		setProtectedTag(*prjid, *grpid)
+	}
 	if len(*tagcsv) > 0 {
-		tagCSV(*tagcsv, *tagnosuffix)
+		tagCSV(*tagcsv, *tagnosuffix, *tagforce)
 	}
 	if len(*tagcsv) == 0 && *tagnosuffix {
 		log.Fatalln("-tagcsv <csvfile> not defined")
